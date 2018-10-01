@@ -13,6 +13,7 @@ import (
 	"github.com/Sirupsen/logrus"
 	"github.com/gorilla/mux"
 	"github.com/mongodb/mongo-go-driver/mongo"
+	"github.com/mongodb/mongo-go-driver/mongo/findopt"
 )
 
 var (
@@ -25,9 +26,12 @@ var (
 )
 
 const (
-	dbName               = "coffee-demo"
-	ordersCollectionName = "orders"
-	dbTimeout            = 5 * time.Second
+	dbName                 = "coffee-demo"
+	ordersCollectionName   = "orders"
+	accountsCollectionName = "employeeAccounts"
+	dbTimeout              = 5 * time.Second
+
+	reportOrderCount = 5
 )
 
 type reportingServer struct {
@@ -39,12 +43,23 @@ type reportingServer struct {
 
 func (rs *reportingServer) reportHandler(w http.ResponseWriter, r *http.Request) {
 	type coffeeOrder struct {
-		CoffeeType string
-		CoffeeQty  int
+		ID         string  `bson:"_id,omitempty" json:"_id,omitempty"`
+		CoffeeType string  `bson:"coffeetype" json:"coffeetype"`
+		CoffeeQty  int     `bson:"coffeeqty" json:"coffeeqty"`
+		EmployeeID string  `bson:"employeeId" json:"employeeId"`
+		Amount     float32 `bson:"amount" json:"amount"`
+	}
+	type employeeAccount struct {
+		ID         string  `bson:"_id,omitempty" json:"_id,omitempty"`
+		EmployeeID string  `bson:"employeeId" json:"employeeId"`
+		Balance    float32 `bson:"balance" json:"balance"`
+		Name       string  `bson:"name" json:"name"`
 	}
 	type report struct {
-		TotalSales  int
-		RecentSales []coffeeOrder
+		TotalSales       int               `json:"totalsales"`
+		TotalRevenue     float32           `json:"totalrevenue"`
+		RecentSales      []coffeeOrder     `json:"recentsales"`
+		EmployeeAccounts []employeeAccount `json:"employeeaccounts"`
 	}
 
 	res := report{}
@@ -53,7 +68,8 @@ func (rs *reportingServer) reportHandler(w http.ResponseWriter, r *http.Request)
 	defer cancel()
 	ordersCollection := rs.mongo.Database(dbName).Collection(ordersCollectionName)
 
-	orderCursor, err := ordersCollection.Find(ctx, nil)
+	// Find the most recent reportOrderCount orders (i.e. find with sort and limit)
+	orderCursor, err := ordersCollection.Find(ctx, nil, findopt.Sort(bson.NewDocument(bson.EC.Int32("_id", -1))), findopt.Limit(reportOrderCount))
 	if err != nil {
 		rs.log.Error("Error querying database: ", err)
 		fmt.Fprintf(w, "[]")
@@ -62,15 +78,57 @@ func (rs *reportingServer) reportHandler(w http.ResponseWriter, r *http.Request)
 
 	defer orderCursor.Close(ctx)
 	for orderCursor.Next(ctx) {
-		orderDoc := bson.NewDocument()
-		if err := orderCursor.Decode(orderDoc); err == nil {
-			rs.log.Info("Order: ", orderDoc)
-			order := coffeeOrder{
-				CoffeeType: orderDoc.Lookup("coffeetype").StringValue(),
-				CoffeeQty:  int(orderDoc.Lookup("coffeeqty").Int64()),
-			}
+		order := coffeeOrder{}
+		if err := orderCursor.Decode(&order); err == nil {
 			res.RecentSales = append(res.RecentSales, order)
 		}
+	}
+
+	accountsCollection := rs.mongo.Database(dbName).Collection(accountsCollectionName)
+	accountCursor, err := accountsCollection.Find(ctx, nil)
+	if err != nil {
+		rs.log.Error("Error querying database: ", err)
+		fmt.Fprintf(w, "[]")
+		return
+	}
+
+	defer accountCursor.Close(ctx)
+	for accountCursor.Next(ctx) {
+		account := employeeAccount{}
+		if err := accountCursor.Decode(&account); err == nil {
+			res.EmployeeAccounts = append(res.EmployeeAccounts, account)
+		}
+	}
+
+	stageGroup := bson.VC.DocumentFromElements(
+		bson.EC.SubDocumentFromElements(
+			"$group",
+			bson.EC.Int64("_id", 0),
+			bson.EC.SubDocumentFromElements(
+				"totalSales",
+				bson.EC.String("$sum", "$coffeeqty"),
+			),
+			bson.EC.SubDocumentFromElements(
+				"totalRevenue",
+				bson.EC.String("$sum", "$amount"),
+			),
+		),
+	)
+
+	totalCursor, err := ordersCollection.Aggregate(ctx, bson.NewArray(stageGroup))
+	if err != nil || !totalCursor.Next(ctx) {
+		rs.log.Error("Error querying database: ", err)
+		fmt.Fprintf(w, "[]")
+		return
+	}
+
+	defer totalCursor.Close(ctx)
+	totalDoc := bson.NewDocument()
+	if err := totalCursor.Decode(totalDoc); err == nil {
+		res.TotalSales = int(totalDoc.Lookup("totalSales").Int64())
+		res.TotalRevenue = float32(totalDoc.Lookup("totalRevenue").Double())
+	} else {
+		rs.log.Error("Error querying database: ", err)
 	}
 
 	jsResults, err := json.Marshal(res)
@@ -85,7 +143,7 @@ func (rs *reportingServer) reportHandler(w http.ResponseWriter, r *http.Request)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Printf("Sending response: %v|%v\n", res, string(jsResults))
+	fmt.Printf("Sending response: %v, JSON: %v\n", res, string(jsResults))
 	fmt.Fprint(w, string(jsResults))
 }
 

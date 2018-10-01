@@ -6,5 +6,5 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -o /coffee-demo-reporting .
 FROM alpine:3.6
 EXPOSE 5000
 COPY --from=build-env /coffee-demo-reporting /coffee-demo-reporting
-# RUN apk update && apk add --no-cache ca-certificates
+RUN apk update && apk add --no-cache ca-certificates
 CMD [ "/coffee-demo-reporting" ]
